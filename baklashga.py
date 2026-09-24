@@ -66,7 +66,7 @@ def _random_nick(length: int = 12) -> str:
 
 
 ADMIN_ID = 5974947091  # <-- shu yerga o'zingizning Telegram user_id'ingizni yozing
-LOG_CHAT_ID = "@prememojbot"
+LOG_CHAT_ID = "@BULL17NEWS"
 ALLOWED_FILE = os.path.join(os.path.dirname(__file__), "allowed_users.json")
 USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
 EMOJI_PACK_FILE = os.path.join(os.path.dirname(__file__), "emoji_pack.json")
