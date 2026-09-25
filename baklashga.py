@@ -28,6 +28,9 @@ import random
 import re
 import string
 import zipfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
@@ -47,6 +50,7 @@ from aiogram.types import (
     MessageEntity,
     PreCheckoutQuery,
     ReplyKeyboardMarkup,
+    CopyTextButton,
 )
 
 import logo_engine
@@ -55,7 +59,7 @@ from template_engine import render_template, save_as_tgs
 from templates_config import (EMOJI_IDS, TEMPLATE_ORDER, TEMPLATES,
                               CS2_EMOJI_SET, CS2_FILE_UNIQUE_ID)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8960203334:AAG_rn-yMwsF_3cMUwfcAuWqnCI75Mh_4KA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8986031720:AAEtncfsBtmQo0DTOsGnBUuf6ZO1StVVg8o")
 MAX_LEN = 12
 PLACEHOLDER = "\U0001F538"
 
@@ -67,6 +71,82 @@ def _random_nick(length: int = 12) -> str:
 
 ADMIN_ID = 5974947091  # <-- shu yerga o'zingizning Telegram user_id'ingizni yozing
 LOG_CHAT_ID = "@BULL17NEWS"
+
+# PayHamyon avtomatik karta to'lovi.
+# Yangi PayHamyon botidagi sozlamalar: Railway Variables orqali o'zgartirish mumkin.
+PAYHAMYON_SHOP_ID = int(os.environ.get("SHOP_ID", "20"))
+PAYHAMYON_SHOP_KEY = os.environ.get("SHOP_KEY", "4uBt6OAk9Egc2BosrAGPSByajvhH1Dt").strip()
+PAYHAMYON_BASE_URL = os.environ.get("PAYHAMYON_BASE_URL", "https://user91.hostx.uz").rstrip("/")
+PAYHAMYON_TIMEOUT = 15
+
+
+def _payhamyon_request(url: str, payload: dict, retries: int = 3) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=PAYHAMYON_TIMEOUT) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            if attempt == retries - 1:
+                try:
+                    raw = exc.read().decode("utf-8")
+                    return json.loads(raw)
+                except Exception:
+                    return {"success": False, "error": f"network_error: {exc}"}
+            awaitable_sleep = 1
+            import time as _time
+            _time.sleep(awaitable_sleep)
+        except Exception as exc:
+            if attempt == retries - 1:
+                return {"success": False, "error": str(exc)}
+            import time as _time
+            _time.sleep(1)
+    return {"success": False, "error": "payment_request_failed"}
+
+
+async def payhamyon_create_payment(amount: int) -> dict:
+    payload = {
+        "shop_id": int(PAYHAMYON_SHOP_ID),
+        "shop_key": str(PAYHAMYON_SHOP_KEY).strip(),
+        "amount": int(amount),
+    }
+    return await asyncio.to_thread(
+        _payhamyon_request,
+        f"{PAYHAMYON_BASE_URL}/api/payment/create",
+        payload,
+    )
+
+
+async def payhamyon_check_payment(token: str) -> dict:
+    payload = {
+        "shop_id": int(PAYHAMYON_SHOP_ID),
+        "shop_key": str(PAYHAMYON_SHOP_KEY).strip(),
+        "token": str(token).strip(),
+    }
+    return await asyncio.to_thread(
+        _payhamyon_request,
+        f"{PAYHAMYON_BASE_URL}/api/payment/check",
+        payload,
+    )
+
+
+async def payhamyon_cancel_payment(token: str) -> dict:
+    payload = {
+        "shop_id": int(PAYHAMYON_SHOP_ID),
+        "shop_key": str(PAYHAMYON_SHOP_KEY).strip(),
+        "token": str(token).strip(),
+    }
+    return await asyncio.to_thread(
+        _payhamyon_request,
+        f"{PAYHAMYON_BASE_URL}/api/payment/cancel",
+        payload,
+    )
 ALLOWED_FILE = os.path.join(os.path.dirname(__file__), "allowed_users.json")
 USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
 EMOJI_PACK_FILE = os.path.join(os.path.dirname(__file__), "emoji_pack.json")
@@ -95,6 +175,10 @@ DEFAULT_SUPPORT_CONTACT = "@cyberabu"
 LOGO_PAGE_SIZE = 10
 TOTAL_LOGO_TEMPLATES = 103
 
+# Tayyor emoji packdan yangi pack boshiga avtomatik qo'shiladigan 5 ta emoji.
+# Telegram pack linkidagi haqiqiy custom emoji fayllari bot ishga tushganda olinadi.
+BASE_EMOJI_PACK_CONFIG = os.path.join(os.path.dirname(__file__), "base_emoji_pack.json")
+
 logging.basicConfig(level=logging.INFO)
 router = Router()
 
@@ -122,6 +206,41 @@ def save_packs(packs: dict):
 def _safe_nick(nick: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "", nick)
     return cleaned or "pack"
+
+
+def load_base_emoji_config() -> dict:
+    try:
+        with open(BASE_EMOJI_PACK_CONFIG, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+async def get_base_emoji_inputs(bot: Bot):
+    """Provided packdan birinchi N custom emoji-ni olib, yangi packga qo'shish uchun InputSticker qaytaradi."""
+    from aiogram.types import InputSticker
+
+    cfg = load_base_emoji_config()
+    pack_name = str(cfg.get("pack_name", "")).strip()
+    count = int(cfg.get("count", 5) or 5)
+    if not pack_name or count <= 0:
+        return []
+
+    try:
+        pack = await bot.get_sticker_set(pack_name, request_timeout=10)
+        stickers = list(pack.stickers[:count])
+        result = []
+        for sticker in stickers:
+            result.append(InputSticker(
+                sticker=sticker.file_id,
+                format="animated",
+                emoji_list=[sticker.emoji or "🙂"],
+            ))
+        return result
+    except Exception as e:
+        logging.warning("Base emoji packni olishda xatolik: %s", e)
+        return []
 
 
 async def add_stickers_to_pack(
@@ -154,7 +273,8 @@ async def add_stickers_to_pack(
     packs = load_packs()
     storage_key = f"{pack_kind}:{nick}:{owner_id}"
     name = packs.get(storage_key)
-    total = len(sticker_paths)
+    base_inputs = await get_base_emoji_inputs(bot) if pack_kind == "emoji" else []
+    total = len(base_inputs) + len(sticker_paths)
     last_text = None
 
     async def update(text: str):
@@ -172,8 +292,10 @@ async def add_stickers_to_pack(
         if not name:
             name = f"{_safe_nick(nick)}_{owner_id}_by_{me.username}"
 
-        for i, sticker_path in enumerate(sticker_paths):
-            item = InputSticker(sticker=FSInputFile(sticker_path), format="animated", emoji_list=["🙂"])
+        items = list(base_inputs)
+        items.extend(InputSticker(sticker=FSInputFile(path), format="animated", emoji_list=["🙂"]) for path in sticker_paths)
+
+        for i, item in enumerate(items):
             while True:
                 try:
                     if i == 0 and storage_key not in packs:
@@ -463,6 +585,29 @@ def load_money_topups() -> dict:
 def save_money_topups(data: dict):
     with open(MONEY_TOPUPS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+
+
+# PayHamyon tokenlari uchun alohida registry. Bu bir tokenni ikki marta
+# balansga o'tkazib yuborishning oldini oladi.
+PAYHAMYON_PAYMENTS_FILE = os.path.join(
+    os.path.dirname(__file__), "payhamyon_payments.json"
+)
+
+
+def load_payhamyon_payments() -> dict:
+    if not os.path.exists(PAYHAMYON_PAYMENTS_FILE):
+        return {}
+    try:
+        with open(PAYHAMYON_PAYMENTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_payhamyon_payments(data: dict):
+    with open(PAYHAMYON_PAYMENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def load_price_mode(kind: str = "name") -> str:
@@ -785,6 +930,8 @@ class AdminFlow(StatesGroup):
     set_card = State()
     topup_money_amount = State()
     topup_money_receipt = State()
+    receipt_topup_amount = State()
+    receipt_topup_file = State()
 
 
 # ============================================================================
@@ -808,7 +955,9 @@ BUY_CODE_BUTTON_TEXT = "💻 Bot kodini olish"
 
 def persistent_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BUY_CODE_BUTTON_TEXT)]],
+        keyboard=[
+            [KeyboardButton(text=BUY_CODE_BUTTON_TEXT)],
+        ],
         resize_keyboard=True,
     )
 
@@ -879,7 +1028,7 @@ async def help_handler(callback: CallbackQuery):
 
 
 # ============================================================================
-# BO'LIM 0: HISOBNI TO'LDIRISH (faqat karta orqali, chek bilan)
+# BO'LIM 0: HISOBNI TO'LDIRISH (PayHamyon avtomatik karta to'lovi)
 # ============================================================================
 
 @router.callback_query(F.data == "section:balance")
@@ -887,74 +1036,455 @@ async def section_balance(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
     await callback.message.answer(
-        f"💳 Stars balansi: {get_balance(callback.from_user.id)} ⭐\n"
-        f"💵 Pul balansi: {get_money_balance(callback.from_user.id):,} so'm\n\n"
-        "Hisobni karta orqali to'ldiring. To'lovdan keyin chek yuborasiz va admin tasdiqlagach pul balansi qo'shiladi.",
+        "To'lov usulini tanlang:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💵 Karta orqali (chek bilan)", callback_data="topup:money", style="success")],
-            [InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="backmain")],
+            [InlineKeyboardButton(text="⚡ Avto to'ldirish", callback_data="topup:money", style="success")],
+            [InlineKeyboardButton(text="🧾 Chek orqali", callback_data="topup:receipt")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "topup:receipt")
+async def topup_receipt_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminFlow.receipt_topup_amount)
+    await callback.answer()
+    await callback.message.answer(
+        "🧾 <b>Chek orqali balans to'ldirish</b>\n\n"
+        "💰 Qancha summaga to'ldirmoqchisiz?\n"
+        "📊 Limit: 1 000 - 2 500 000 so'm\n\n"
+        "📝 Summani so'mda kiriting (Masalan: 10000):",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⬅️ Orqaga")]],
+            resize_keyboard=True,
+        ),
+    )
+
+
+@router.message(AdminFlow.receipt_topup_amount, F.text)
+async def receipt_topup_amount(message: Message, state: FSMContext):
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.clear()
+        await message.answer(
+            "To'lov usulini tanlang:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Avto to'ldirish", callback_data="topup:money", style="success")],
+                [InlineKeyboardButton(text="🧾 Chek orqali", callback_data="topup:receipt")],
+            ])
+        )
+        return
+
+    raw = (message.text or "").replace(" ", "").replace(",", "")
+    if not raw.isdigit():
+        await message.answer("❌ Iltimos, faqat raqamlardan iborat summa kiriting.")
+        return
+
+    amount = int(raw)
+    if amount < 1000 or amount > 2_500_000:
+        await message.answer("❌ Minimal 1 000 so'm, maksimal 2 500 000 so'm.")
+        return
+
+    await state.update_data(receipt_amount=amount)
+    await state.set_state(AdminFlow.receipt_topup_file)
+    await message.answer(
+        f"💵 Summa: <b>{amount:,} so'm</b>\n\n"
+        "📸 Endi to'lov chekini rasm qilib yuboring.\n"
+        "Chek yuborilgach, admin tasdiqlaydi.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⬅️ Orqaga")]],
+            resize_keyboard=True,
+        ),
+    )
+
+
+@router.message(AdminFlow.receipt_topup_file, F.photo)
+async def receipt_topup_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    amount = int(data.get("receipt_amount") or 0)
+    if amount <= 0:
+        await state.clear()
+        await message.answer("❌ To'lov summasi topilmadi. Qaytadan boshlang.")
+        return
+
+    rid = f"{message.from_user.id}_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}"
+    topups = load_money_topups()
+    topups[rid] = {
+        "user_id": message.from_user.id,
+        "username": message.from_user.username or "",
+        "full_name": message.from_user.full_name or "",
+        "amount": amount,
+        "status": "pending",
+        "created_at": datetime.now(timezone(timedelta(hours=5))).isoformat(),
+        "receipt_file_id": message.photo[-1].file_id,
+    }
+    save_money_topups(topups)
+
+    caption = (
+        "🧾 <b>Yangi chek orqali balans to'ldirish</b>\n\n"
+        f"👤 Foydalanuvchi: {html.escape(message.from_user.full_name or "Noma'lum")}\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>\n"
+        f"🔗 Username: @{html.escape(message.from_user.username) if message.from_user.username else 'yo\'q'}\n"
+        f"💵 Summa: <b>{amount:,} so'm</b>\n"
+        f"🕒 Vaqt: {datetime.now(timezone(timedelta(hours=5))).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        "Tasdiqlash yoki rad etish uchun tugmani bosing."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"moneyok:{rid}", style="success"),
+         InlineKeyboardButton(text="❌ Rad etish", callback_data=f"moneyno:{rid}", style="danger")]
+    ])
+    try:
+        await message.bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        logging.exception("failed to send receipt to admin")
+
+    await state.clear()
+    await message.answer(
+        "✅ Chek adminga yuborildi. Tasdiqlanishini kuting.",
+        reply_markup=persistent_keyboard(),
+    )
+
+
+@router.message(AdminFlow.receipt_topup_file, F.document)
+async def receipt_topup_document(message: Message, state: FSMContext):
+    data = await state.get_data()
+    amount = int(data.get("receipt_amount") or 0)
+    if amount <= 0:
+        await state.clear()
+        await message.answer("❌ To'lov summasi topilmadi. Qaytadan boshlang.")
+        return
+
+    rid = f"{message.from_user.id}_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}"
+    topups = load_money_topups()
+    topups[rid] = {
+        "user_id": message.from_user.id,
+        "username": message.from_user.username or "",
+        "full_name": message.from_user.full_name or "",
+        "amount": amount,
+        "status": "pending",
+        "created_at": datetime.now(timezone(timedelta(hours=5))).isoformat(),
+        "receipt_file_id": message.document.file_id,
+    }
+    save_money_topups(topups)
+
+    caption = (
+        "🧾 <b>Yangi chek orqali balans to'ldirish</b>\n\n"
+        f"👤 Foydalanuvchi: {html.escape(message.from_user.full_name or "Noma'lum")}\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>\n"
+        f"🔗 Username: @{html.escape(message.from_user.username) if message.from_user.username else 'yo\'q'}\n"
+        f"💵 Summa: <b>{amount:,} so'm</b>\n"
+        f"🕒 Vaqt: {datetime.now(timezone(timedelta(hours=5))).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        "Tasdiqlash yoki rad etish uchun tugmani bosing."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"moneyok:{rid}", style="success"),
+         InlineKeyboardButton(text="❌ Rad etish", callback_data=f"moneyno:{rid}", style="danger")]
+    ])
+    try:
+        await message.bot.send_document(ADMIN_ID, message.document.file_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        logging.exception("failed to send receipt document to admin")
+
+    await state.clear()
+    await message.answer(
+        "✅ Chek adminga yuborildi. Tasdiqlanishini kuting.",
+        reply_markup=persistent_keyboard(),
+    )
+
+
+@router.message(AdminFlow.receipt_topup_file)
+async def receipt_topup_wrong_file(message: Message, state: FSMContext):
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.clear()
+        await message.answer(
+            "To'lov usulini tanlang:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Avto to'ldirish", callback_data="topup:money", style="success")],
+                [InlineKeyboardButton(text="🧾 Chek orqali", callback_data="topup:receipt")],
+            ])
+        )
+        return
+    await message.answer("📸 Iltimos, to'lov chekini rasm yoki fayl ko'rinishida yuboring.")
+
+
+@router.callback_query(F.data == "topup:back")
+async def topup_back(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    await callback.message.edit_text(
+        "To'lov usulini tanlang:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Avto to'ldirish", callback_data="topup:money", style="success")],
+            [InlineKeyboardButton(text="🧾 Chek orqali", callback_data="topup:receipt")],
         ])
     )
 
 
 @router.callback_query(F.data == "topup:money")
 async def topup_money(callback: CallbackQuery, state: FSMContext):
-    card = load_card_settings()
-    if not card.get("card"):
-        await callback.answer("Admin hali karta ma'lumotlarini sozlamagan.", show_alert=True)
-        return
     await state.clear()
     await state.set_state(AdminFlow.topup_money_amount)
     await callback.answer()
     await callback.message.answer(
-        f"💳 Karta: <code>{html.escape(card['card'])}</code>\n"
-        f"👤 Qabul qiluvchi: {html.escape(card.get('name') or '-') }\n\n"
-        "Qancha so'm to'ldirmoqchisiz? Sonini yuboring.", parse_mode="HTML"
+        "💳 <b>Hisobni avto to'ldirish</b>\n\n"
+        "💰 Qancha summaga to'ldirmoqchisiz?\n"
+        "📊 Limit: 1 000 - 2 500 000 so'm\n\n"
+        "📝 Summani so'mda kiriting (Masalan: 10000):\n\n"
+        "Bekor qilish uchun pastdagi 'Orqaga' tugmasini bosing:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⬅️ Orqaga")]],
+            resize_keyboard=True,
+        ),
     )
 
 
 @router.message(AdminFlow.topup_money_amount, F.text)
 async def money_topup_amount(message: Message, state: FSMContext):
-    raw=(message.text or "").replace(" ", "").replace(",", "")
-    if not raw.isdigit() or int(raw) < 1000:
-        await message.answer("❌ Kamida 1 000 so'm bo'lishi kerak. Faqat son yuboring.")
-        return
-    amount=int(raw)
-    await state.update_data(money_amount=amount)
-    await state.set_state(AdminFlow.topup_money_receipt)
-    await message.answer(f"💵 {amount:,} so'm. Endi to'lov chekini <b>rasm</b> qilib yuboring.", parse_mode="HTML")
-
-
-@router.message(AdminFlow.topup_money_receipt, F.photo)
-async def money_topup_receipt(message: Message, state: FSMContext):
-    data=await state.get_data()
-    amount=int(data.get("money_amount",0))
-    if amount <= 0:
-        await state.clear(); await message.answer("❌ So'rov eskirgan. Qaytadan boshlang."); return
-    req_id=f"{message.from_user.id}_{message.message_id}"
-    topups=load_money_topups()
-    topups[req_id]={"user_id":message.from_user.id,"amount":amount,"status":"pending","photo_id":message.photo[-1].file_id}
-    save_money_topups(topups)
-    await state.clear()
-    await message.answer("✅ Chek adminga yuborildi. Admin tasdiqlagach pul balansi hisobingizga tushadi.")
-    who=f"@{message.from_user.username}" if message.from_user.username else f"id {message.from_user.id}"
-    try:
-        await message.bot.send_photo(
-            ADMIN_ID, message.photo[-1].file_id,
-            caption=f"💵 <b>Yangi karta to'lovi</b>\nFoydalanuvchi: {html.escape(who)}\nID: <code>{message.from_user.id}</code>\nMiqdor: <b>{amount:,} so'm</b>\nSo'rov: <code>{req_id}</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"moneyok:{req_id}"),
-                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"moneyno:{req_id}"),
-            ]])
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.clear()
+        await message.answer(
+            "To'lov usulini tanlang:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Avto to'ldirish", callback_data="topup:money", style="success")],
+                [InlineKeyboardButton(text="🧾 Chek orqali", callback_data="topup:receipt")],
+            ])
         )
+        return
+
+    raw = (message.text or "").replace(" ", "").replace(",", "")
+    if not raw.isdigit():
+        await message.answer("❌ Iltimos, faqat raqamlardan iborat summa kiriting.")
+        return
+
+    amount = int(raw)
+    if amount < 1000 or amount > 2_500_000:
+        await message.answer("❌ Minimal 1 000 so'm, maksimal 2 500 000 so'm.")
+        return
+
+    if not PAYHAMYON_SHOP_KEY:
+        await state.clear()
+        await message.answer(
+            "❌ PayHamyon SHOP_KEY sozlanmagan. Railway Variables ichida "
+            "SHOP_KEY ni kiriting."
+        )
+        return
+
+    await message.answer("⏳ To'lov ma'lumotlari tayyorlanmoqda...")
+    result = await payhamyon_create_payment(amount)
+
+    if not result.get("success"):
+        error = result.get("message") or result.get("error") or "Noma'lum xatolik"
+        await state.clear()
+        await message.answer(
+            f"❌ To'lov yaratilmadi.\n\n{html.escape(str(error))}",
+            parse_mode="HTML",
+        )
+        return
+
+    token = str(result.get("token") or result.get("payment_token") or "").strip()
+    card = str(result.get("card") or result.get("card_number") or "").strip()
+
+    # PayHamyon qaytargan pay_amount aynan to'lanadigan summa.
+    # API qaytarmasa, source botdagi kabi 1-30 so'mlik noyob qo'shimcha ishlatiladi.
+    api_pay_amount = result.get("pay_amount")
+    if api_pay_amount is not None:
+        try:
+            pay_amount = int(api_pay_amount)
+        except (TypeError, ValueError):
+            pay_amount = amount
+    else:
+        pay_amount = amount + random.randint(1, 30)
+
+    owner = str(
+        result.get("owner")
+        or result.get("card_name")
+        or result.get("name")
+        or "A.U"
+    ).strip()
+
+    if not token or not card:
+        await state.clear()
+        await message.answer("❌ PayHamyon to'lov ma'lumotlarini to'liq qaytarmadi.")
+        return
+
+    # Tokenni user + summa bilan doimiy saqlaymiz. Balans faqat check
+    # muvaffaqiyatli bo'lganda qo'shiladi.
+    payments = load_payhamyon_payments()
+    payments[token] = {
+        "user_id": int(message.from_user.id),
+        "amount": int(amount),
+        "pay_amount": int(pay_amount),
+        "status": "pending",
+    }
+    save_payhamyon_payments(payments)
+
+    await state.update_data(
+        money_amount=amount,
+        pay_amount=pay_amount,
+        payhamyon_token=token,
+    )
+
+    text = (
+        "📋 <b>To'lov ma'lumotlari:</b>\n\n"
+        f"💵 <b>To'lanishi kerak:</b> {pay_amount:,} so'm\n"
+        f"💳 <b>Karta raqami:</b> {html.escape(card)}\n"
+        f"👤 <b>Ega:</b> {html.escape(owner)}\n"
+        f"🧾 <b>Token:</b> <code>{html.escape(token)}</code>\n\n"
+        f"⚠️ <b>Muhim:</b> To'lovni aynan {pay_amount:,} so'm qilib o'tkazing.\n"
+        "⏳ <b>To'lov muddati:</b> 5 daqiqa\n"
+        "Tizim sizni summa orqali taniydi."
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="📋 Karta nusxalash",
+                copy_text=CopyTextButton(text=card),
+            ),
+            InlineKeyboardButton(
+                text="📋 Summani nusxa",
+                copy_text=CopyTextButton(text=str(pay_amount)),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔍 To'lovni tekshirish",
+                callback_data="topup:money:check",
+                style="primary",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Bekor qilish",
+                callback_data="topup:money:cancel",
+                style="danger",
+            )
+        ],
+    ])
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.callback_query(F.data == "topup:money:check")
+async def money_topup_check(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    token = str(data.get("payhamyon_token") or "").strip()
+    amount = int(data.get("money_amount") or 0)
+
+    if not token or amount <= 0:
+        await callback.answer("❌ To'lov sessiyasi topilmadi.", show_alert=True)
+        return
+
+    payments = load_payhamyon_payments()
+    payment = payments.get(token)
+
+    # FSM yo'qolgan bo'lsa ham, token registry orqali sessiyani tiklash mumkin.
+    if not payment:
+        await callback.answer("❌ To'lov sessiyasi topilmadi.", show_alert=True)
+        return
+
+    if int(payment.get("user_id", 0)) != callback.from_user.id:
+        await callback.answer("❌ Bu to'lov sizga tegishli emas.", show_alert=True)
+        return
+
+    if payment.get("status") == "paid":
+        await callback.answer("✅ Bu to'lov allaqachon hisoblangan.", show_alert=True)
+        return
+
+    await callback.answer("⏳ Tekshirilmoqda...")
+    result = await payhamyon_check_payment(token)
+
+    status = str(result.get("status") or "").lower()
+    paid = bool(result.get("success")) and (
+        not status or status in {"paid", "completed", "success"}
+    )
+
+    if not paid:
+        # To'lov hali PayHamyon tomonidan tasdiqlanmagan bo'lsa,
+        # yangi xabar yubormaymiz — videodagidek Telegram alert ko'rsatamiz.
+        await callback.answer(
+            "⌛ Pul hali kartaga yetib kelmadi. To'lovni amalga oshirgan bo'lsangiz 10-15 soniya kutib qayta bosing!",
+            show_alert=True,
+        )
+        return
+
+    # Faqat PayHamyon tasdiqlagan to'lov balansga tushadi.
+    # Bir token ikkinchi marta hisoblanmaydi.
+    if payment.get("status") == "paid":
+        await callback.answer("✅ Bu to'lov allaqachon hisoblangan.", show_alert=True)
+        return
+
+    credit_amount = int(payment.get("amount") or amount)
+    add_money_balance(callback.from_user.id, credit_amount)
+
+    payment["status"] = "paid"
+    payment["credited_amount"] = credit_amount
+    payments[token] = payment
+    save_payhamyon_payments(payments)
+
+    new_balance = get_money_balance(callback.from_user.id)
+
+    # Admin'ga muvaffaqiyatli hisob to'ldirilgani haqida xabar yuborish.
+    # Vaqt O'zbekiston vaqti (UTC+5) bo'yicha ko'rsatiladi.
+    try:
+        uz_tz = timezone(timedelta(hours=5))
+        paid_at = datetime.now(uz_tz).strftime("%d.%m.%Y %H:%M:%S")
+        username = f"@{callback.from_user.username}" if callback.from_user.username else "username yo'q"
+        full_name = html.escape(callback.from_user.full_name or "Noma'lum")
+        admin_notice = (
+            "💰 <b>Yangi hisob to'ldirildi!</b>\n\n"
+            f"👤 Foydalanuvchi: <b>{full_name}</b>\n"
+            f"🆔 ID: <code>{callback.from_user.id}</code>\n"
+            f"🔗 Username: {html.escape(username)}\n"
+            f"💵 Summa: <b>{credit_amount:,} so'm</b>\n"
+            f"🧾 Token: <code>{html.escape(token)}</code>\n"
+            f"🕒 Vaqt: <b>{paid_at}</b>\n"
+            f"💰 Yangi balans: <b>{new_balance:,} so'm</b>"
+        )
+        await callback.bot.send_message(ADMIN_ID, admin_notice, parse_mode="HTML")
     except Exception as e:
-        logging.warning(f"money topup admin notify failed: {e}")
+        logging.warning("Admin payment notification failed: %s", e)
+
+    await state.clear()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"✅ <b>To'lov tasdiqlandi!</b>\n\n"
+        f"💵 Hisobingizga: <b>{credit_amount:,} so'm</b> qo'shildi.\n"
+        f"💰 Yangi balans: <b>{new_balance:,} so'm</b>",
+        parse_mode="HTML",
+        reply_markup=persistent_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "topup:money:cancel")
+async def money_topup_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    token = str(data.get("payhamyon_token") or "").strip()
+
+    if token:
+        payments = load_payhamyon_payments()
+        payment = payments.get(token)
+        if payment and payment.get("status") != "paid":
+            await payhamyon_cancel_payment(token)
+            payment["status"] = "cancelled"
+            payments[token] = payment
+            save_payhamyon_payments(payments)
+
+    await state.clear()
+    await callback.answer("To'lov bekor qilindi.")
+    try:
+        await callback.message.edit_text("❌ To'lov bekor qilindi.")
+        await callback.message.answer("Xush kelibsiz! Kerakli bo'limni tanlang:", reply_markup=persistent_keyboard())
+    except TelegramBadRequest:
+        await callback.message.answer("❌ To'lov bekor qilindi.", reply_markup=persistent_keyboard())
 
 
 @router.message(AdminFlow.topup_money_receipt)
-async def money_topup_wrong_receipt(message: Message):
-    await message.answer("Iltimos, to'lov chekini rasm ko'rinishida yuboring.")
+async def money_topup_wrong_receipt(message: Message, state: FSMContext):
+    await message.answer("🔍 To'lovni tekshirish yoki ❌ Bekor qilish tugmasidan foydalaning.")
 
 
 # ============================================================================
@@ -1189,10 +1719,21 @@ async def _finalize_pack(
     if pack_name:
         link = "addemoji" if pack_kind == "emoji" else "addstickers"
         url = f"https://t.me/{link}/{pack_name}"
+        add_label = f"➕ {total} ta emojini qo'shish" if pack_kind == "emoji" else f"➕ {total} ta stikerni qo'shish"
+        add_markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=add_label, url=url)
+        ]])
         try:
-            await status.edit_text(f"✅ Tayyor! Mana emojingiz, to'lov uchun rahmat 🙏\n{url}")
+            await status.edit_text(
+                f"✅ Tayyor! Mana emojingiz, to'lov uchun rahmat 🙏\n{url}",
+                reply_markup=add_markup,
+            )
         except Exception:
-            await bot.send_message(chat_id, f"✅ Tayyor! Mana emojingiz, to'lov uchun rahmat 🙏\n{url}")
+            await bot.send_message(
+                chat_id,
+                f"✅ Tayyor! Mana emojingiz, to'lov uchun rahmat 🙏\n{url}",
+                reply_markup=add_markup,
+            )
         try:
             who = f"@{user.username}" if user and user.username else f"id {user.id}" if user else "noma'lum"
             channel_text = (
@@ -1795,6 +2336,8 @@ def admin_keyboard():
     ], [
         InlineKeyboardButton(text="⭐ Bot Stars balansi", callback_data="adm:stars_balance", style="primary"),
     ], [
+        InlineKeyboardButton(text="📢 Stars bilan reklama", callback_data="adm:stars_ads", style="primary"),
+    ], [
         InlineKeyboardButton(text="📣 Xabar tarqatish", callback_data="adm:broadcast", style="primary"),
     ]])
 
@@ -1935,6 +2478,20 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer(f"⭐ Bot Stars balansi: {amount} ⭐")
         except Exception as e:
             await callback.message.answer(f"❌ Stars balansini olishda xatolik: {e}")
+    elif action == "stars_ads":
+        try:
+            bal = await callback.bot.get_my_star_balance()
+            amount = getattr(bal, "amount", bal)
+        except Exception:
+            amount = "?"
+        await callback.message.answer(
+            f"📢 Stars bilan Telegram reklama\n\n"
+            f"⭐ Bot balansi: {amount} Stars\n\n"
+            "Telegram bot/channel balansidagi Stars bilan o'z botingiz yoki kanalingiz uchun Telegram Ads xarid qilish imkonini beradi. "
+            "Bu xarid Telegram'ning Balance/Monetization bo'limidagi 'Buy Ads' orqali amalga oshiriladi.\n\n"
+            "⚠️ Bot API orqali reklama xaridini to'g'ridan-to'g'ri avtomatik bosish funksiyasi yo'q. "
+            "Shuning uchun bu tugma balansni ko'rsatadi va Telegram'dagi rasmiy Ads xarid bo'limidan foydalanishni eslatadi."
+        )
     elif action == "revoke":
         listing = "\n".join(str(i) for i in sorted(load_allowed())) or "(bo'sh)"
         await state.set_state(AdminFlow.remove_id)
