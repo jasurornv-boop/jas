@@ -70,7 +70,7 @@ def _random_nick(length: int = 12) -> str:
 
 
 ADMIN_ID = 5974947091  # <-- shu yerga o'zingizning Telegram user_id'ingizni yozing
-LOG_CHAT_ID = "@BULL17NEWS"
+LOG_CHAT_ID = "@PREMEMOJ"
 
 # PayHamyon avtomatik karta to'lovi.
 # Yangi PayHamyon botidagi sozlamalar: Railway Variables orqali o'zgartirish mumkin.
