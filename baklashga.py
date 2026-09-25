@@ -59,7 +59,7 @@ from template_engine import render_template, save_as_tgs
 from templates_config import (EMOJI_IDS, TEMPLATE_ORDER, TEMPLATES,
                               CS2_EMOJI_SET, CS2_FILE_UNIQUE_ID)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8986031720:AAEtncfsBtmQo0DTOsGnBUuf6ZO1StVVg8o")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8960203334:AAG_rn-yMwsF_3cMUwfcAuWqnCI75Mh_4KA")
 MAX_LEN = 12
 PLACEHOLDER = "\U0001F538"
 
